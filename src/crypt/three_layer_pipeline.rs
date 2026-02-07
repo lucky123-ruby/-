@@ -1,0 +1,1126 @@
+use crate::crypt::aes_ctr::create_aes_ctr_engine;
+use crate::crypt::aes_ctr_ni::create_aes_ctr_ni_engine;
+use crate::crypt::affinity::ThreadAffinityManager;
+use crate::crypt::config::Config;
+use crate::crypt::engine::EncryptionAlgorithm;
+use crate::crypt::lockfree_pool::LockFreeBufferPool;
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use dashmap::DashSet;
+use lru::LruCache;
+use std::cell::RefCell;
+use std::fs;
+use std::io::Seek;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Condvar;
+use std::sync::Once;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// 系统信息缓存，避免重复查询
+struct SystemInfoCache {
+    total_memory: AtomicU64,
+    available_memory: AtomicU64,
+    num_cores: AtomicUsize,
+    initialized: AtomicUsize,
+}
+
+static SYSTEM_INFO_CACHE: SystemInfoCache = SystemInfoCache {
+    total_memory: AtomicU64::new(0),
+    available_memory: AtomicU64::new(0),
+    num_cores: AtomicUsize::new(0),
+    initialized: AtomicUsize::new(0),
+};
+
+static SYSTEM_INFO_INIT: Once = Once::new();
+
+fn get_cached_system_info() -> (u64, u64, usize) {
+    SYSTEM_INFO_INIT.call_once(|| {
+        use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+
+        let mut sys = System::new_with_specifics(
+            RefreshKind::new().with_memory(MemoryRefreshKind::everything()),
+        );
+        sys.refresh_memory();
+
+        let total_memory = sys.total_memory();
+        let available_memory = sys.available_memory();
+        let num_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        SYSTEM_INFO_CACHE
+            .total_memory
+            .store(total_memory, Ordering::Relaxed);
+        SYSTEM_INFO_CACHE
+            .available_memory
+            .store(available_memory, Ordering::Relaxed);
+        SYSTEM_INFO_CACHE
+            .num_cores
+            .store(num_cores, Ordering::Relaxed);
+        SYSTEM_INFO_CACHE
+            .initialized
+            .store(1usize, Ordering::Relaxed);
+    });
+
+    (
+        SYSTEM_INFO_CACHE.total_memory.load(Ordering::Relaxed),
+        SYSTEM_INFO_CACHE.available_memory.load(Ordering::Relaxed),
+        SYSTEM_INFO_CACHE.num_cores.load(Ordering::Relaxed),
+    )
+}
+
+/// 线程局部的路径缓存，避免重复的系统调用
+thread_local! {
+    static PATH_CACHE: RefCell<lru::LruCache<PathBuf, PathBuf>> = RefCell::new(lru::LruCache::new(std::num::NonZeroUsize::new(2048).unwrap()));
+}
+
+/// 规范化路径，确保在整个流程中使用一致的路径格式
+/// 在Windows上，移除\\?\前缀以保持一致性
+/// 使用 LRU 缓存避免重复的 canonicalize() 系统调用
+fn normalize_path(path: &Path) -> PathBuf {
+    PATH_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+
+        if let Some(cached) = cache.get(path) {
+            return cached.clone();
+        }
+
+        let path_str = path.to_string_lossy();
+
+        let normalized = if path_str.starts_with("\\\\?\\") {
+            PathBuf::from(&path_str[4..])
+        } else {
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let canonical_str = canonical.to_string_lossy();
+            if canonical_str.starts_with("\\\\?\\") {
+                PathBuf::from(&canonical_str[4..])
+            } else {
+                canonical
+            }
+        };
+
+        cache.put(path.to_path_buf(), normalized.clone());
+        normalized
+    })
+}
+
+/// 缓冲区大小常量
+const MIN_BUFFER_SIZE: usize = 64 * 1024; // 64KB - 最小缓冲区
+const DEFAULT_BUFFER_SIZE: usize = 1024 * 1024; // 1MB - 默认缓冲区
+const MAX_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16MB - 最大缓冲区，大幅提升
+const CACHE_CAPACITY: usize = 128; // 缓存容量：128个缓冲区，平衡速度和内存
+
+/// 动态计算缓冲区配置
+/// 优化策略：保持总内存占用不变（可用内存的75%），但使用4KB缓冲区大幅增加份数
+fn calculate_buffer_config() -> (usize, usize) {
+    let (total_memory, available_memory, num_cores) = get_cached_system_info();
+
+    let total_threads = num_cores * 6;
+
+    // 固定使用4KB缓冲区大小，与加密策略保持一致
+    const FIXED_BUFFER_SIZE: usize = 4 * 1024; // 4KB
+    let buffer_size = FIXED_BUFFER_SIZE;
+
+    // 保持总内存占用不变：使用可用内存的75%
+    const MEMORY_USAGE_RATIO: u64 = 75; // 75%的可用内存
+    let total_memory_budget = (available_memory * MEMORY_USAGE_RATIO) / 100;
+    
+    // 计算最大缓冲区份数：总内存预算 ÷ 每个缓冲区大小
+    // 添加调试信息来诊断问题
+    let max_pool_size = if total_memory_budget > 0 && buffer_size > 0 {
+        (total_memory_budget / buffer_size as u64) as usize
+    } else {
+        0
+    };
+    
+    // 添加调试输出，帮助诊断问题
+    println!("[DEBUG] Available memory: {} bytes", available_memory);
+    println!("[DEBUG] Memory budget: {} bytes", total_memory_budget);
+    println!("[DEBUG] Buffer size: {} bytes", buffer_size);
+    println!("[DEBUG] Calculated max_pool_size: {}", max_pool_size);
+    println!("[DEBUG] Total threads: {}", total_threads);
+    
+    // 直接使用内存预算允许的最大份数，真正达到75%可用内存的使用
+    let pool_size = if max_pool_size > 0 {
+        max_pool_size  // 使用内存预算允许的最大值
+    } else {
+        total_threads * 4  // 最低保障：至少每个线程4个缓冲区
+    };
+
+    println!(
+        "[BUFFER CONFIG] Total memory: {}MB, Available: {}MB",
+        total_memory / 1024 / 1024,
+        available_memory / 1024 / 1024
+    );
+    println!(
+        "[BUFFER CONFIG] Memory budget: {}MB ({}% of available)",
+        total_memory_budget / 1024 / 1024,
+        MEMORY_USAGE_RATIO
+    );
+    println!(
+        "[BUFFER CONFIG] Buffer size: {}KB, Pool size: {}",
+        buffer_size / 1024,
+        pool_size
+    );
+    println!(
+        "[BUFFER CONFIG] Total buffer memory: {}MB",
+        (buffer_size * pool_size) / 1024 / 1024
+    );
+    println!(
+        "[BUFFER CONFIG] Buffer efficiency: {} buffers per thread",
+        pool_size / total_threads
+    );
+
+    (buffer_size, pool_size)
+}
+
+#[derive(Debug, Clone)]
+pub struct EncryptionTask {
+    pub file_path: PathBuf,
+    pub canonical_path: PathBuf,
+    pub file_size: u64,
+    pub data: Vec<u8>,
+    pub offset: u64,
+    pub sequence_number: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct WriteTask {
+    pub file_path: PathBuf,
+    pub canonical_path: PathBuf,
+    pub encrypted_data: Vec<u8>,
+    pub offset: u64,
+    pub sequence_number: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DirectoryTask {
+    dir_path: PathBuf,
+    depth: usize,
+}
+
+pub struct ThreeLayerPipeline {
+    config: Arc<Config>,
+    encryption_engine: Arc<dyn EncryptionAlgorithm>,
+    running: Arc<AtomicBool>,
+
+    traversal_threads: usize,
+    encrypt_threads: usize,
+    write_threads: usize,
+
+    traversal_tx: Sender<DirectoryTask>,
+    traversal_rx: Receiver<DirectoryTask>,
+
+    encrypt_tx: Sender<EncryptionTask>,
+    encrypt_rx: Receiver<EncryptionTask>,
+
+    write_tx: Sender<WriteTask>,
+    write_rx: Receiver<WriteTask>,
+
+    files_processed: Arc<AtomicU64>,
+    bytes_encrypted: Arc<AtomicU64>,
+    errors: Arc<AtomicUsize>,
+
+    read_pool: Arc<LockFreeBufferPool>,
+    encrypt_pool: Arc<LockFreeBufferPool>,
+    write_pool: Arc<LockFreeBufferPool>,
+
+    active_workers: Arc<AtomicUsize>,
+
+    traversal_completed: Arc<AtomicBool>,
+
+    tasks_in_queue: Arc<AtomicU64>,
+    tasks_completed: Arc<AtomicU64>,
+
+    completion_condvar: Arc<Condvar>,
+    completion_mutex: Arc<Mutex<bool>>,
+
+    affinity_manager: Arc<ThreadAffinityManager>,
+
+    sequence_counter: Arc<AtomicU64>,
+
+    files_being_processed: Arc<DashSet<PathBuf>>,
+}
+
+impl ThreeLayerPipeline {
+    pub fn new(config: Arc<Config>, key: [u8; 16]) -> Self {
+        let num_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        let total_threads = num_cores * 6;
+        let traversal_threads = total_threads / 2;
+        let encrypt_threads = total_threads / 3;
+        let write_threads = total_threads / 6;
+
+        let (traversal_tx, traversal_rx) = unbounded();
+        let (encrypt_tx, encrypt_rx) = unbounded();
+        let (write_tx, write_rx) = unbounded();
+
+        let encryption_engine = create_aes_ctr_engine_with_hardware_acceleration(key);
+
+        let (buffer_size, pool_size) = calculate_buffer_config();
+        let read_pool = Arc::new(LockFreeBufferPool::new(pool_size, buffer_size));
+        let encrypt_pool = Arc::new(LockFreeBufferPool::new(pool_size, buffer_size));
+        let write_pool = Arc::new(LockFreeBufferPool::new(pool_size, buffer_size));
+
+        let affinity_manager = Arc::new(ThreadAffinityManager::new());
+        let completion_condvar = Arc::new(Condvar::new());
+        let completion_mutex = Arc::new(Mutex::new(false));
+        let files_being_processed = Arc::new(DashSet::new());
+
+        Self {
+            config,
+            encryption_engine,
+            running: Arc::new(AtomicBool::new(false)),
+            traversal_threads,
+            encrypt_threads,
+            write_threads,
+            traversal_tx,
+            traversal_rx,
+            encrypt_tx,
+            encrypt_rx,
+            write_tx,
+            write_rx,
+            files_processed: Arc::new(AtomicU64::new(0)),
+            bytes_encrypted: Arc::new(AtomicU64::new(0)),
+            errors: Arc::new(AtomicUsize::new(0)),
+            read_pool,
+            encrypt_pool,
+            write_pool,
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            traversal_completed: Arc::new(AtomicBool::new(false)),
+            tasks_in_queue: Arc::new(AtomicU64::new(0)),
+            tasks_completed: Arc::new(AtomicU64::new(0)),
+            completion_condvar,
+            completion_mutex,
+            affinity_manager,
+            sequence_counter: Arc::new(AtomicU64::new(0)),
+            files_being_processed,
+        }
+    }
+
+    pub fn start(&self) {
+        self.running.store(true, Ordering::SeqCst);
+
+        let active_workers = self.active_workers.clone();
+        let affinity_manager = self.affinity_manager.clone();
+        let num_cores = affinity_manager.get_processor_count();
+        let numa_enabled = affinity_manager.is_numa_enabled();
+        let numa_node_count = affinity_manager.get_numa_node_count();
+        let files_being_processed = self.files_being_processed.clone();
+
+        for i in 0..self.traversal_threads {
+            let dir_rx = self.traversal_rx.clone();
+            let dir_tx = self.traversal_tx.clone();
+            let file_tx = self.encrypt_tx.clone();
+            let pool = self.read_pool.clone();
+            let config = self.config.clone();
+            let running = self.running.clone();
+            let errors = self.errors.clone();
+            let active_workers = active_workers.clone();
+            let tasks_in_queue = self.tasks_in_queue.clone();
+            let sequence_counter = self.sequence_counter.clone();
+            let affinity_manager = affinity_manager.clone();
+            let files_being_processed = files_being_processed.clone();
+            let thread_index = i;
+
+            thread::spawn(move || {
+                if numa_enabled && numa_node_count > 1 {
+                    let numa_node = (thread_index / 3) % numa_node_count;
+                    let _ =
+                        affinity_manager.bind_current_thread_to_numa_node(numa_node, thread_index);
+                } else {
+                    let core_id = (thread_index / 3) % num_cores;
+                    affinity_manager.set_current_thread_affinity(Some(core_id));
+                }
+                Self::traversal_read_worker(
+                    i,
+                    dir_rx,
+                    file_tx,
+                    dir_tx,
+                    pool,
+                    config,
+                    running,
+                    errors,
+                    active_workers,
+                    tasks_in_queue,
+                    sequence_counter,
+                    files_being_processed,
+                );
+            });
+        }
+
+        for i in 0..self.encrypt_threads {
+            let rx = self.encrypt_rx.clone();
+            let tx = self.write_tx.clone();
+            let pool = self.encrypt_pool.clone();
+            let engine = self.encryption_engine.clone();
+            let running = self.running.clone();
+            let errors = self.errors.clone();
+            let bytes_encrypted = self.bytes_encrypted.clone();
+            let active_workers = active_workers.clone();
+            let tasks_in_queue = self.tasks_in_queue.clone();
+            let affinity_manager = affinity_manager.clone();
+            let thread_index = i;
+
+            thread::spawn(move || {
+                if numa_enabled && numa_node_count > 1 {
+                    let numa_node = (thread_index / 3) % numa_node_count;
+                    let _ =
+                        affinity_manager.bind_current_thread_to_numa_node(numa_node, thread_index);
+                } else {
+                    let core_id = (thread_index / 3) % num_cores;
+                    affinity_manager.set_current_thread_affinity(Some(core_id));
+                }
+                Self::encrypt_layer_worker(
+                    i,
+                    rx,
+                    tx,
+                    pool,
+                    engine,
+                    running,
+                    errors,
+                    bytes_encrypted,
+                    active_workers,
+                    tasks_in_queue,
+                );
+            });
+        }
+
+        for i in 0..self.write_threads {
+            let rx = self.write_rx.clone();
+            let pool = self.write_pool.clone();
+            let running = self.running.clone();
+            let errors = self.errors.clone();
+            let files_processed = self.files_processed.clone();
+            let config = self.config.clone();
+            let active_workers = active_workers.clone();
+            let tasks_in_queue = self.tasks_in_queue.clone();
+            let tasks_completed = self.tasks_completed.clone();
+            let affinity_manager = affinity_manager.clone();
+            let completion_condvar = self.completion_condvar.clone();
+            let files_being_processed = files_being_processed.clone();
+            let thread_index = i;
+
+            thread::spawn(move || {
+                if numa_enabled && numa_node_count > 1 {
+                    let numa_node = (thread_index / 3) % numa_node_count;
+                    let _ =
+                        affinity_manager.bind_current_thread_to_numa_node(numa_node, thread_index);
+                } else {
+                    let core_id = (thread_index / 3) % num_cores;
+                    affinity_manager.set_current_thread_affinity(Some(core_id));
+                }
+                Self::write_layer_worker(
+                    i,
+                    rx,
+                    pool,
+                    running,
+                    errors,
+                    files_processed,
+                    config,
+                    active_workers,
+                    tasks_in_queue,
+                    tasks_completed,
+                    completion_condvar,
+                    files_being_processed,
+                );
+            });
+        }
+    }
+
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    pub fn request_shutdown(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        // 不等待，让工作线程自然退出
+    }
+
+    pub fn shutdown_senders(&self) {
+        drop(self.traversal_tx.clone());
+        drop(self.encrypt_tx.clone());
+        drop(self.write_tx.clone());
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    pub fn shutdown_traversal_sender(&self) {
+        drop(self.traversal_tx.clone());
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    pub fn wait_for_traversal_completion(&self) {
+        println!("Waiting for traversal workers to complete...");
+
+        let start_time = Instant::now();
+
+        loop {
+            let active = self.active_workers.load(Ordering::Relaxed);
+            let traversal_done = self.traversal_completed.load(Ordering::Relaxed);
+            let in_queue = self.tasks_in_queue.load(Ordering::Relaxed);
+
+            if traversal_done && in_queue == 0 && active == 0 {
+                println!("Traversal completed. All workers finished.");
+                break;
+            }
+
+            let elapsed = start_time.elapsed();
+            if elapsed > Duration::from_secs(60) {
+                eprintln!("[WARNING] wait_for_traversal_completion taking longer than expected");
+                eprintln!(
+                    "[WARNING] Active workers: {}, Tasks in queue: {}, Traversal done: {}",
+                    active, in_queue, traversal_done
+                );
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    pub fn shutdown_senders_and_stop(&self) {
+        drop(self.traversal_tx.clone());
+        drop(self.encrypt_tx.clone());
+        drop(self.write_tx.clone());
+        self.running.store(false, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    pub fn add_directory(&self, dir_path: &Path) -> Result<(), String> {
+        let task = DirectoryTask {
+            dir_path: dir_path.to_path_buf(),
+            depth: 0,
+        };
+
+        self.traversal_tx
+            .send(task)
+            .map_err(|e| format!("Failed to send directory task: {}", e))?;
+
+        Ok(())
+    }
+
+    pub fn add_file_for_retry(&self, file_path: &Path) -> Result<(), String> {
+        let file_path_buf = normalize_path(file_path);
+
+        if !self.files_being_processed.insert(file_path_buf.clone()) {
+            return Ok(());
+        }
+
+        let metadata = fs::metadata(&file_path_buf).map_err(|e| {
+            self.files_being_processed.remove(&file_path_buf);
+            format!("Failed to get file metadata: {}", e)
+        })?;
+
+        let file_size = metadata.len();
+
+        // 新策略：固定4KB加密大小
+        const FIXED_ENCRYPT_SIZE: u64 = 4 * 1024; // 4KB
+        
+        let bytes_to_encrypt = if file_size <= FIXED_ENCRYPT_SIZE {
+            // 小于等于4KB的文件全加密
+            file_size
+        } else {
+            // 大于4KB的文件只加密前4KB
+            FIXED_ENCRYPT_SIZE
+        };
+        let bytes_to_encrypt = std::cmp::max(bytes_to_encrypt, 1);
+
+        let sequence_number = self.sequence_counter.fetch_add(1, Ordering::SeqCst);
+
+        let data =
+            match Self::read_file_header_impl(&file_path_buf, bytes_to_encrypt, &self.read_pool) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.files_being_processed.remove(&file_path_buf);
+                    return Err(e);
+                }
+            };
+
+        let encrypt_task = EncryptionTask {
+            file_path: file_path_buf.clone(),
+            canonical_path: file_path_buf.clone(),
+            file_size,
+            data,
+            offset: 0,
+            sequence_number,
+        };
+
+        self.encrypt_tx.send(encrypt_task).map_err(|e| {
+            self.files_being_processed.remove(&file_path_buf);
+            format!("Failed to send encryption task: {}", e)
+        })?;
+
+        self.tasks_in_queue.fetch_add(1, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    pub fn mark_traversal_completed(&self) {
+        self.traversal_completed.store(true, Ordering::SeqCst);
+        println!("File traversal marked as completed");
+        self.completion_condvar.notify_all();
+    }
+
+    pub fn wait_for_completion(&self) {
+        self.wait_for_completion_with_timeout(None)
+    }
+
+    pub fn wait_for_completion_with_timeout(&self, timeout: Option<Duration>) {
+        let total_workers = self.traversal_threads + self.encrypt_threads + self.write_threads;
+        println!("Waiting for {} workers to complete...", total_workers);
+
+        let start_time = Instant::now();
+        let mut last_status_time = start_time;
+        let mut last_completed = 0u64;
+
+        loop {
+            // 使用更强的内存顺序确保状态一致性
+            let active = self.active_workers.load(Ordering::SeqCst);
+            let traversal_done = self.traversal_completed.load(Ordering::SeqCst);
+            let in_queue = self.tasks_in_queue.load(Ordering::SeqCst);
+            let completed = self.tasks_completed.load(Ordering::SeqCst);
+
+            if traversal_done && in_queue == 0 && active == 0 {
+                println!("All tasks processed. Total tasks completed: {}", completed);
+                println!("All workers stopped");
+                break;
+            }
+
+            let elapsed = start_time.elapsed();
+
+            if let Some(timeout) = timeout {
+                if elapsed > timeout {
+                    eprintln!(
+                        "[TIMEOUT] wait_for_completion timed out after {:?}",
+                        timeout
+                    );
+                    eprintln!("[TIMEOUT] Active workers: {}, Tasks in queue: {}, Tasks completed: {}, Traversal done: {}", 
+                        active, in_queue, completed, traversal_done);
+                    eprintln!(
+                        "[TIMEOUT] This may indicate a deadlock or stuck task. Forcing shutdown..."
+                    );
+                    self.running.store(false, Ordering::SeqCst);
+                    break;
+                }
+            }
+
+            let status_elapsed = last_status_time.elapsed();
+            if status_elapsed > Duration::from_secs(5)
+                || (completed > 0 && completed != last_completed)
+            {
+                println!("[STATUS] Active workers: {}, Tasks in queue: {}, Tasks completed: {}, Elapsed: {:.1}s", 
+                    active, in_queue, completed, elapsed.as_secs_f64());
+                last_status_time = Instant::now();
+                last_completed = completed;
+            }
+
+            // 改进条件变量使用，防止虚假唤醒
+            let guard = self.completion_mutex.lock().unwrap();
+
+            // 重新检查条件，防止虚假唤醒
+            let active = self.active_workers.load(Ordering::SeqCst);
+            let traversal_done = self.traversal_completed.load(Ordering::SeqCst);
+            let in_queue = self.tasks_in_queue.load(Ordering::SeqCst);
+
+            if traversal_done && in_queue == 0 && active == 0 {
+                drop(guard);
+                continue;
+            }
+
+            let remaining_timeout = timeout.map(|t| t.saturating_sub(elapsed));
+
+            if let Some(remaining) = remaining_timeout {
+                let (guard, timeout_result) = self
+                    .completion_condvar
+                    .wait_timeout(guard, remaining)
+                    .unwrap();
+                    
+                // 检查是否超时
+                if timeout_result.timed_out() {
+                    // 超时后重新检查条件
+                    continue;
+                }
+                drop(guard);
+            } else {
+                let guard = self.completion_condvar.wait(guard).unwrap();
+                drop(guard);
+            }
+        }
+    }
+    pub fn get_stats(&self) -> (u64, u64, usize) {
+        (
+            self.files_processed.load(Ordering::Relaxed),
+            self.bytes_encrypted.load(Ordering::Relaxed),
+            self.errors.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn verify_encryption_completion(&self) -> bool {
+        // 使用更强的内存顺序确保状态一致性
+        let active = self.active_workers.load(Ordering::SeqCst);
+        let traversal_done = self.traversal_completed.load(Ordering::SeqCst);
+        let in_queue = self.tasks_in_queue.load(Ordering::SeqCst);
+        let completed = self.tasks_completed.load(Ordering::SeqCst);
+        
+        println!("[VERIFICATION] Active workers: {}, Tasks in queue: {}, Tasks completed: {}, Traversal done: {}",
+            active, in_queue, completed, traversal_done);
+        
+        // 验证加密是否真正完成
+        let is_completed = traversal_done && in_queue == 0 && active == 0;
+        
+        if is_completed {
+            println!("[VERIFICATION] Encryption verified as completed");
+        } else {
+            println!("[VERIFICATION] Encryption not fully completed");
+        }
+        
+        is_completed
+    }
+    fn traversal_read_worker(
+        worker_id: usize,
+        dir_rx: Receiver<DirectoryTask>,
+        file_tx: Sender<EncryptionTask>,
+        dir_tx: Sender<DirectoryTask>,
+        pool: Arc<LockFreeBufferPool>,
+        config: Arc<Config>,
+        running: Arc<AtomicBool>,
+        errors: Arc<AtomicUsize>,
+        active_workers: Arc<AtomicUsize>,
+        tasks_in_queue: Arc<AtomicU64>,
+        sequence_counter: Arc<AtomicU64>,
+        files_being_processed: Arc<DashSet<PathBuf>>,
+    ) {
+        println!("Traversal+Read worker {} started", worker_id);
+        active_workers.fetch_add(1, Ordering::Relaxed);
+
+        while running.load(Ordering::Relaxed) {
+            match dir_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(dir_task) => {
+                    Self::traverse_and_read_directory(
+                        &dir_task.dir_path,
+                        &file_tx,
+                        &dir_tx,
+                        &pool,
+                        &config,
+                        &sequence_counter,
+                        &tasks_in_queue,
+                        &files_being_processed,
+                    );
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    continue;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+
+        println!("Traversal+Read worker {} stopped", worker_id);
+        active_workers.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn traverse_and_read_directory(
+        dir_path: &Path,
+        file_tx: &Sender<EncryptionTask>,
+        dir_tx: &Sender<DirectoryTask>,
+        pool: &Arc<LockFreeBufferPool>,
+        config: &Config,
+        sequence_counter: &Arc<AtomicU64>,
+        tasks_in_queue: &Arc<AtomicU64>,
+        files_being_processed: &Arc<DashSet<PathBuf>>,
+    ) {
+        use crate::crypt::utils;
+
+        let entries = match fs::read_dir(dir_path) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Failed to read directory {:?}: {}", dir_path, e);
+                return;
+            }
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("Failed to read entry in {:?}: {}", dir_path, e);
+                    continue;
+                }
+            };
+            let path = entry.path();
+
+            if path.is_file() {
+                if utils::should_encrypt_file_with_config(&path, config) {
+                    let mut retry_count = 0;
+                    loop {
+                        let queue_len = file_tx.len();
+                        if queue_len < 48000 {
+                            if Self::read_and_create_task(
+                                &path,
+                                file_tx,
+                                pool,
+                                config,
+                                sequence_counter,
+                                tasks_in_queue,
+                                files_being_processed,
+                            )
+                            .is_err()
+                            {
+                                eprintln!("Failed to read file {:?}", path);
+                            }
+                            break;
+                        }
+                        retry_count += 1;
+                        if retry_count > 20 {
+                            eprintln!("[BACKPRESSURE] Skipping file after 20 retries: {:?}", path);
+                            break;
+                        }
+                        if queue_len > 49500 {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        } else {
+                            std::hint::spin_loop();
+                        }
+                    }
+                }
+            } else if path.is_dir() {
+                if utils::should_traverse_directory(&path) {
+                    let queue_len = file_tx.len();
+                    if queue_len > 49500 {
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                    } else if queue_len > 48000 {
+                        std::hint::spin_loop();
+                    }
+                    let dir_task = DirectoryTask {
+                        dir_path: path,
+                        depth: 0,
+                    };
+
+                    if dir_tx.send(dir_task).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn read_and_create_task(
+        file_path: &Path,
+        file_tx: &Sender<EncryptionTask>,
+        pool: &Arc<LockFreeBufferPool>,
+        config: &Config,
+        sequence_counter: &Arc<AtomicU64>,
+        tasks_in_queue: &Arc<AtomicU64>,
+        files_being_processed: &Arc<DashSet<PathBuf>>,
+    ) -> Result<(), String> {
+        let file_path_buf = normalize_path(file_path);
+        println!(
+            "[DEBUG] Found file: {:?} (normalized: {:?})",
+            file_path, file_path_buf
+        );
+
+        if !files_being_processed.insert(file_path_buf.clone()) {
+            println!(
+                "[DEBUG] File already in processing set: {:?}",
+                file_path_buf
+            );
+            return Ok(());
+        }
+
+        let metadata = fs::metadata(&file_path_buf).map_err(|e| {
+            files_being_processed.remove(&file_path_buf);
+            format!("Failed to get file metadata: {}", e)
+        })?;
+
+        let file_size = metadata.len();
+
+        const FIXED_ENCRYPT_SIZE: u64 = 4 * 1024;
+
+        let bytes_to_encrypt = if file_size <= FIXED_ENCRYPT_SIZE {
+            file_size
+        } else {
+            FIXED_ENCRYPT_SIZE
+        };
+        let bytes_to_encrypt = std::cmp::max(bytes_to_encrypt, 1);
+
+        let sequence_number = sequence_counter.fetch_add(1, Ordering::SeqCst);
+
+        let data = match Self::read_file_header_impl(&file_path_buf, bytes_to_encrypt, pool) {
+            Ok(d) => d,
+            Err(e) => {
+                files_being_processed.remove(&file_path_buf);
+                return Err(e);
+            }
+        };
+
+        let encrypt_task = EncryptionTask {
+            file_path: file_path_buf.clone(),
+            canonical_path: file_path_buf.clone(),
+            file_size,
+            data,
+            offset: 0,
+            sequence_number,
+        };
+
+        file_tx.send(encrypt_task).map_err(|e| {
+            files_being_processed.remove(&file_path_buf);
+            format!("Failed to send encryption task: {}", e)
+        })?;
+
+        tasks_in_queue.fetch_add(1, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    fn read_file_header_impl(
+        file_path: &Path,
+        bytes_to_read: u64,
+        pool: &Arc<LockFreeBufferPool>,
+    ) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+
+        let mut file =
+            fs::File::open(file_path).map_err(|e| format!("Failed to open file: {}", e))?;
+
+        let buffer_size = std::cmp::min(bytes_to_read as usize, MAX_BUFFER_SIZE);
+        let mut buffer = pool.acquire();
+        buffer.resize(buffer_size, 0);
+
+        let bytes_read = file
+            .read(&mut buffer)
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+
+        buffer.truncate(bytes_read);
+
+        Ok(buffer)
+    }
+
+    fn encrypt_layer_worker(
+        worker_id: usize,
+        rx: Receiver<EncryptionTask>,
+        tx: Sender<WriteTask>,
+        pool: Arc<LockFreeBufferPool>,
+        engine: Arc<dyn EncryptionAlgorithm>,
+        running: Arc<AtomicBool>,
+        errors: Arc<AtomicUsize>,
+        bytes_encrypted: Arc<AtomicU64>,
+        active_workers: Arc<AtomicUsize>,
+        tasks_in_queue: Arc<AtomicU64>,
+    ) {
+        println!("Encrypt layer worker {} started", worker_id);
+        active_workers.fetch_add(1, Ordering::Relaxed);
+
+        while running.load(Ordering::Relaxed) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(mut task) => match Self::encrypt_data(&mut task, &engine, &pool) {
+                    Ok(encrypted_data) => {
+                        bytes_encrypted.fetch_add(encrypted_data.len() as u64, Ordering::Relaxed);
+
+                        let write_task = WriteTask {
+                            file_path: normalize_path(&task.file_path),
+                            canonical_path: normalize_path(&task.canonical_path),
+                            encrypted_data,
+                            offset: task.offset,
+                            sequence_number: task.sequence_number,
+                        };
+
+                        if tx.send(write_task).is_err() {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                            tasks_in_queue.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Encrypt worker {} error: {}", worker_id, e);
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        tasks_in_queue.fetch_sub(1, Ordering::Relaxed);
+                    }
+                },
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    continue;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+
+        println!("Encrypt layer worker {} stopped", worker_id);
+        active_workers.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn write_layer_worker(
+        worker_id: usize,
+        rx: Receiver<WriteTask>,
+        pool: Arc<LockFreeBufferPool>,
+        running: Arc<AtomicBool>,
+        errors: Arc<AtomicUsize>,
+        files_processed: Arc<AtomicU64>,
+        config: Arc<Config>,
+        active_workers: Arc<AtomicUsize>,
+        tasks_in_queue: Arc<AtomicU64>,
+        tasks_completed: Arc<AtomicU64>,
+        completion_condvar: Arc<Condvar>,
+        files_being_processed: Arc<DashSet<PathBuf>>,
+    ) {
+        println!("Write layer worker {} started", worker_id);
+        active_workers.fetch_add(1, Ordering::Relaxed);
+
+        while running.load(Ordering::Relaxed) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(mut task) => {
+                    println!(
+                        "[DEBUG] Write worker {} processing file: {:?} (canonical: {:?})",
+                        worker_id, task.file_path, task.canonical_path
+                    );
+                    match Self::write_encrypted_data(&mut task, &pool) {
+                        Ok(success) => {
+                            if success {
+                                files_being_processed.remove(&task.canonical_path);
+                                files_processed.fetch_add(1, Ordering::Relaxed);
+                                tasks_completed.fetch_add(1, Ordering::Relaxed);
+                                tasks_in_queue.fetch_sub(1, Ordering::Relaxed);
+
+                                let remaining_tasks = tasks_in_queue.load(Ordering::Relaxed);
+                                if remaining_tasks <= 10 {
+                                    completion_condvar.notify_all();
+                                } else {
+                                    completion_condvar.notify_one();
+                                }
+
+                                let new_path = task.file_path.with_extension(format!(
+                                    "{}.locked",
+                                    task.file_path
+                                        .extension()
+                                        .and_then(|ext| ext.to_str())
+                                        .unwrap_or("")
+                                ));
+
+                                if let Err(e) = fs::rename(&task.file_path, &new_path) {
+                                    eprintln!(
+                                        "[ERROR] Failed to rename file {:?} to {:?}: {}",
+                                        task.file_path, new_path, e
+                                    );
+                                    errors.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    println!("[ENCRYPTED] {:?}", new_path);
+                                }
+                            } else {
+                                files_being_processed.remove(&task.canonical_path);
+                                tasks_in_queue.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[ERROR] Write worker {} error: {}", worker_id, e);
+                            files_being_processed.remove(&task.canonical_path);
+                            errors.fetch_add(1, Ordering::Relaxed);
+                            tasks_in_queue.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    continue;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+
+        println!("Write layer worker {} stopped", worker_id);
+        active_workers.fetch_sub(1, Ordering::Relaxed);
+        completion_condvar.notify_all();
+    }
+
+    fn encrypt_data(
+        task: &mut EncryptionTask,
+        engine: &Arc<dyn EncryptionAlgorithm>,
+        pool: &Arc<LockFreeBufferPool>,
+    ) -> Result<Vec<u8>, String> {
+        let encrypted = engine
+            .encrypt(&task.data)
+            .map_err(|e| format!("Encryption failed: {}", e))?;
+
+        let mut result = pool.acquire();
+        result.extend_from_slice(&encrypted);
+
+        pool.release(std::mem::take(&mut task.data));
+
+        Ok(result)
+    }
+
+    fn write_encrypted_data(
+        task: &mut WriteTask,
+        pool: &Arc<LockFreeBufferPool>,
+    ) -> Result<bool, String> {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        let result = OpenOptions::new().write(true).open(&task.canonical_path);
+
+        match result {
+            Ok(mut file) => {
+                file.seek(std::io::SeekFrom::Start(task.offset))
+                    .map_err(|e| format!("Failed to seek in file: {}", e))?;
+
+                file.write_all(&task.encrypted_data)
+                    .map_err(|e| format!("Failed to write encrypted data: {}", e))?;
+
+                file.flush()
+                    .map_err(|e| format!("Failed to flush file: {}", e))?;
+
+                pool.release(std::mem::take(&mut task.encrypted_data));
+
+                Ok(true)
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                println!(
+                    "[DEBUG] Failed to open file {:?} for writing: {}",
+                    task.canonical_path, error_msg
+                );
+                if error_msg.contains("os error 32")
+                    || error_msg.contains("进程无法访问")
+                    || error_msg.contains("另一个程序正在使用此文件")
+                {
+                    eprintln!(
+                        "[SKIP] File locked by another process: {:?} (canonical: {:?})",
+                        task.file_path, task.canonical_path
+                    );
+                    pool.release(std::mem::take(&mut task.encrypted_data));
+                    Ok(false)
+                } else {
+                    Err(format!("Failed to open file for writing: {}", e))
+                }
+            }
+        }
+    }
+}
+
+impl crate::crypt::network::PipelineControllerTrait for ThreeLayerPipeline {
+    fn add_encryption_task(&self, input: &Path, _output: &Path, _priority: i32) {
+        let _ = self.add_file_for_retry(input);
+    }
+
+    fn wait_for_completion(&self) {
+        self.wait_for_completion();
+    }
+}
+
+fn create_aes_ctr_engine_with_hardware_acceleration(key: [u8; 16]) -> Arc<dyn EncryptionAlgorithm> {
+    use crate::crypt::engine::is_aesni_supported;
+
+    if is_aesni_supported() {
+        if let Ok(engine) = std::panic::catch_unwind(|| create_aes_ctr_ni_engine(key)) {
+            if let Ok(_) = engine.encrypt(&[0u8; 1024]) {
+                return engine;
+            }
+        }
+    }
+
+    create_aes_ctr_engine(key)
+}
